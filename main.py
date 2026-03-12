@@ -385,6 +385,18 @@ def format_morning(dir_alerts, stale_items, blank_items, today, enable_mentions)
     header = f"📋 サンキャク 本日のタスクアラート（{date_str}）"
     if enable_mentions:
         header += "\n<users/all>"
+
+    # 全体で超過・期限迫りがあるか判定
+    any_urgent = any(
+        m[3]
+        for clients in dir_alerts.values()
+        for msgs in clients.values()
+        for m in msgs
+    )
+    ryu_display, ryu_id = MANAGERS["Ryu"]
+    if any_urgent and enable_mentions and ryu_id:
+        header += f"\ncc: <users/{ryu_id}>"
+
     lines = [header]
 
     # --- Dir別アラート ---
