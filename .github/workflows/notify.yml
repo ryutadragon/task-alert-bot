@@ -2,9 +2,18 @@ name: Task Alert Bot
 
 on:
   schedule:
-    # 毎日JST 9:00（UTC 00:00）月〜土
+    # 朝9時 JST（UTC 00:00）月〜土
     - cron: '0 0 * * 1-6'
-  workflow_dispatch: # 手動実行用
+    # 12時 JST（UTC 03:00）月〜土
+    - cron: '0 3 * * 1-6'
+    # 16時 JST（UTC 07:00）月〜土
+    - cron: '0 7 * * 1-6'
+  workflow_dispatch:
+    inputs:
+      run_mode:
+        description: '実行モード (morning / followup)'
+        required: false
+        default: 'morning'
 
 permissions:
   id-token: write
@@ -31,9 +40,22 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Determine run mode
+        id: mode
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "mode=${{ github.event.inputs.run_mode || 'morning' }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event.schedule }}" = "0 0 * * 1-6" ]; then
+            echo "mode=morning" >> $GITHUB_OUTPUT
+          else
+            echo "mode=followup" >> $GITHUB_OUTPUT
+          fi
+
       - name: Run alert bot
         env:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           SHEET_NAME: ${{ secrets.SHEET_NAME }}
           GOOGLE_CHAT_WEBHOOK_URL: ${{ secrets.GOOGLE_CHAT_WEBHOOK_URL }}
+          RUN_MODE: ${{ steps.mode.outputs.mode }}
+          ENABLE_MENTIONS: ${{ secrets.ENABLE_MENTIONS }}
         run: python main.py

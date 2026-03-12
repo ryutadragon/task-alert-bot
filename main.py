@@ -1,6 +1,10 @@
 """
 サンキャク 案件管理タスクアラートBot
 Master_DBシートを読み取り、Dir別にタスク状況をGoogle Chatに通知する。
+
+RUN_MODE:
+  morning  - 朝の全体通知（@全員 + Dir別全アラート）
+  followup - 12時/16時の超過フォロー（超過のみ + 管理者メンション）
 """
 
 import os
@@ -23,6 +27,12 @@ DIR_INFO = {
     "さとしゅん": ("佐藤竣",  ""),  # TODO: Google Chat user ID
 }
 
+# 管理者（超過フォロー時にメンション）
+MANAGERS = {
+    "Sho":  ("池上翔",   ""),  # TODO: Google Chat user ID
+    "Ryu":  ("竹内竜太", ""),  # TODO: Google Chat user ID
+}
+
 # 除外ステータス
 SKIP_STATUSES = ["7. 納品/公開待"]
 
@@ -31,10 +41,10 @@ COL = {
     "ID": 0,           # A
     "CLIENT": 1,       # B
     "PROJECT": 3,      # D
-    "MEMO": 5,         # F - 次のタスク/メモ
+    "MEMO": 5,         # F
     "STATUS": 7,       # H
     "THUMB": 8,        # I - サムネ進捗
-    "NEXT_DATE": 10,   # K - 次の期日
+    "NEXT_DATE": 10,   # K
     "DEADLINE": 12,    # M - 締切/公開
     "EDIT_START": 13,  # N - 編集着手
     "DRAFT_PERIOD": 14,# O - 初稿期間(営業日)
@@ -85,6 +95,13 @@ def add_business_days(start_date, num_days):
     return current
 
 
+def mention(name, user_id, enable):
+    """メンション文字列を生成"""
+    if enable and user_id:
+        return f"<users/{user_id}>"
+    return name
+
+
 # ---------- データ取得 ----------
 
 
@@ -109,8 +126,7 @@ def fetch_sheet_data():
 
 def analyze_project(row, today):
     """案件を分析してアラートメッセージのリストを返す。
-    Returns: [(emoji, message, sort_priority)]
-      sort_priority: 小さいほど緊急（負=超過, 0=本日, 正=残日数）
+    Returns: [(emoji, message, sort_priority, is_overdue_or_today)]
     """
     messages = []
 
@@ -137,15 +153,13 @@ def analyze_project(row, today):
         future_shoots = [d for d in shoot_dates if d >= today]
         all_shot_done = len(future_shoots) == 0
 
-        # 未来の撮影日アラート
         for sd in future_shoots:
             diff = (sd - today).days
             if diff == 0:
-                messages.append(("🚨", f"「{project}」の撮影は*本日*です", 0))
+                messages.append(("🚨", f"「{project}」の撮影は*本日*です", 0, True))
             elif diff <= 14:
-                messages.append(("📅", f"「{project}」は撮影日まであと*{diff}日*です", diff))
+                messages.append(("📅", f"「{project}」は撮影日まであと*{diff}日*です", diff, False))
 
-        # 撮影済み → 素材展開・サムネ発注・文言ぎめが必要
         if all_shot_done and status in [
             "0. 未着手/相談中",
             "1. 企画/撮影準備",
@@ -157,11 +171,10 @@ def analyze_project(row, today):
                 messages.append((
                     "🎬",
                     f"「{project}」は撮影が終わったので、素材の展開と、サムネイルの発注、文言ぎめが必要です",
-                    -1,
+                    -1, True,
                 ))
 
     # --- 初稿提出期限 ---
-    # 先方確認以降は初稿済みなのでスキップ
     draft_done_statuses = ["4. 社内QC", "5. 先方確認", "6. 修正対応中"]
     draft_already_done = any(s in status for s in draft_done_statuses)
 
@@ -179,32 +192,31 @@ def analyze_project(row, today):
     if draft_deadline:
         diff = (draft_deadline - today).days
         if diff < 0:
-            messages.append(("💀", f"「{project}」は初稿提出期限を*{abs(diff)}日超過*しています", diff))
+            messages.append(("💀", f"「{project}」は初稿提出期限を*{abs(diff)}日超過*しています", diff, True))
         elif diff == 0:
-            messages.append(("🚨", f"「{project}」の初稿提出は*本日*です", 0))
+            messages.append(("🚨", f"「{project}」の初稿提出は*本日*です", 0, True))
         elif diff <= 10:
-            messages.append(("📝", f"「{project}」は初稿提出まであと*{diff}日*", diff))
+            messages.append(("📝", f"「{project}」は初稿提出まであと*{diff}日*", diff, False))
 
-        # サムネイル文言（初稿と同じタイミング、サムネ未完了の場合）
         thumb_done = thumb_status and ("完了" in thumb_status or "なし" in thumb_status)
         if not thumb_done:
             if diff < 0:
-                messages.append(("💀", f"「{project}」サムネイル文言の提出期限を*{abs(diff)}日超過*しています", diff))
+                messages.append(("💀", f"「{project}」サムネイル文言の提出期限を*{abs(diff)}日超過*しています", diff, True))
             elif diff == 0:
-                messages.append(("🚨", f"「{project}」サムネイル文言の提出期限は*本日*です", 0))
+                messages.append(("🚨", f"「{project}」サムネイル文言の提出期限は*本日*です", 0, True))
             elif diff <= 10:
-                messages.append(("📌", f"「{project}」サムネイル文言の提出期限まであと*{diff}日*です", diff))
+                messages.append(("📌", f"「{project}」サムネイル文言の提出期限まであと*{diff}日*です", diff, False))
 
     # --- 締切/公開 ---
     deadline = parse_date(get_cell(row, COL["DEADLINE"]), today)
     if deadline:
         diff = (deadline - today).days
         if diff < 0:
-            messages.append(("💀", f"「{project}」の締切/公開を*{abs(diff)}日超過*しています", diff))
+            messages.append(("💀", f"「{project}」の締切/公開を*{abs(diff)}日超過*しています", diff, True))
         elif diff == 0:
-            messages.append(("🚨", f"「{project}」の締切/公開は*本日*です", 0))
+            messages.append(("🚨", f"「{project}」の締切/公開は*本日*です", 0, True))
         elif diff <= 14:
-            messages.append(("⏰", f"「{project}」の締切/公開まであと*{diff}日*", diff))
+            messages.append(("⏰", f"「{project}」の締切/公開まであと*{diff}日*", diff, False))
 
     return messages
 
@@ -224,7 +236,6 @@ def build_dir_alerts(rows, today):
             continue
 
         client = get_cell(row, COL["CLIENT"])
-
         messages = analyze_project(row, today)
 
         if messages:
@@ -240,35 +251,95 @@ def build_dir_alerts(rows, today):
 # ---------- メッセージ整形 ----------
 
 
-def format_message(dir_alerts, today):
+def format_morning(dir_alerts, today, enable_mentions):
+    """朝の全体通知: @全員 + Dir別全アラート。超過・本日にはDir個人メンション"""
     date_str = today.strftime("%Y/%m/%d")
-    enable_mentions = os.environ.get("ENABLE_MENTIONS", "false").lower() == "true"
 
     if not dir_alerts:
         return f"📋 サンキャク 本日のタスクアラート（{date_str}）\n\n✅ 本日のアラートはありません"
 
-    lines = [f"📋 サンキャク 本日のタスクアラート（{date_str}）"]
+    header = f"📋 サンキャク 本日のタスクアラート（{date_str}）"
+    if enable_mentions:
+        header += "\n<users/all>"
+
+    lines = [header]
 
     for dir_name in ["Sho", "翔太", "さとしゅん"]:
         if dir_name not in dir_alerts:
             continue
 
         display_name, user_id = DIR_INFO[dir_name]
-        if enable_mentions and user_id:
-            mention = f"<users/{user_id}>"
+
+        # このDirに超過・本日アラートがあるか
+        has_urgent = False
+        for msgs in dir_alerts[dir_name].values():
+            if any(m[3] for m in msgs):
+                has_urgent = True
+                break
+
+        if has_urgent and enable_mentions and user_id:
+            name_line = f"📣 <users/{user_id}>"
         else:
-            mention = f"{display_name}さん"
+            name_line = f"📣 {display_name}さん"
+
         lines.append("")
         lines.append("━━━━━━━━━━━━━━")
-        lines.append(f"📣 {mention}")
+        lines.append(name_line)
         lines.append("━━━━━━━━━━━━━━")
 
-        clients = dir_alerts[dir_name]
-        for client, messages in clients.items():
+        for client, messages in dir_alerts[dir_name].items():
             messages.sort(key=lambda m: m[2])
             lines.append("")
             lines.append(f"▸ {client}")
-            for emoji, msg, _ in messages:
+            for emoji, msg, _, _ in messages:
+                lines.append(f"  {emoji} {msg}")
+
+    return "\n".join(lines)
+
+
+def format_followup(dir_alerts, today, enable_mentions):
+    """12時/16時フォロー: 超過案件のみ + 管理者メンション"""
+    date_str = today.strftime("%Y/%m/%d")
+
+    # 超過アラートだけ抽出
+    overdue_alerts = {}
+    for dir_name, clients in dir_alerts.items():
+        for client, messages in clients.items():
+            overdue_msgs = [m for m in messages if m[2] < 0]
+            if overdue_msgs:
+                if dir_name not in overdue_alerts:
+                    overdue_alerts[dir_name] = {}
+                overdue_alerts[dir_name][client] = overdue_msgs
+
+    if not overdue_alerts:
+        return None  # 超過なし → 送信しない
+
+    # 管理者メンション
+    manager_mentions = []
+    for mgr_name, (display, uid) in MANAGERS.items():
+        manager_mentions.append(mention(display, uid, enable_mentions))
+    manager_line = " ".join(manager_mentions)
+
+    lines = [f"🔔 超過案件フォローアップ（{date_str}）"]
+    lines.append(f"cc: {manager_line}")
+
+    for dir_name in ["Sho", "翔太", "さとしゅん"]:
+        if dir_name not in overdue_alerts:
+            continue
+
+        display_name, user_id = DIR_INFO[dir_name]
+        name_str = mention(display_name, user_id, enable_mentions)
+
+        lines.append("")
+        lines.append("━━━━━━━━━━━━━━")
+        lines.append(f"📣 {name_str}")
+        lines.append("━━━━━━━━━━━━━━")
+
+        for client, messages in overdue_alerts[dir_name].items():
+            messages.sort(key=lambda m: m[2])
+            lines.append("")
+            lines.append(f"▸ {client}")
+            for emoji, msg, _, _ in messages:
                 lines.append(f"  {emoji} {msg}")
 
     return "\n".join(lines)
@@ -290,18 +361,29 @@ def send_to_google_chat(message):
 
 def main():
     today = date.today()
-    print(f"実行日: {today}")
+    run_mode = os.environ.get("RUN_MODE", "morning")
+    enable_mentions = os.environ.get("ENABLE_MENTIONS", "false").lower() == "true"
+
+    print(f"実行日: {today} / モード: {run_mode} / メンション: {enable_mentions}")
 
     try:
         header, rows = fetch_sheet_data()
         if not header:
-            send_to_google_chat(
-                f"📋 サンキャク 本日のタスクアラート（{today.strftime('%Y/%m/%d')}）\n\n✅ データがありません"
-            )
+            if run_mode == "morning":
+                send_to_google_chat(
+                    f"📋 サンキャク 本日のタスクアラート（{today.strftime('%Y/%m/%d')}）\n\n✅ データがありません"
+                )
             return
 
         dir_alerts = build_dir_alerts(rows, today)
-        message = format_message(dir_alerts, today)
+
+        if run_mode == "morning":
+            message = format_morning(dir_alerts, today, enable_mentions)
+        else:
+            message = format_followup(dir_alerts, today, enable_mentions)
+            if message is None:
+                print("超過案件なし → フォロー通知スキップ")
+                return
 
         print("--- 通知メッセージ ---")
         print(message)
