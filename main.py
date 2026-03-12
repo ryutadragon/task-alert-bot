@@ -1,13 +1,11 @@
 """
 サンキャク 案件管理タスクアラートBot
-Googleスプレッドシートの案件管理シートを読み取り、
-期限が近いタスクをGoogle Chatに通知する。
+Master_DBシートを読み取り、Dir別にタスク状況をGoogle Chatに通知する。
 """
 
-import json
 import os
 import sys
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 
 import gspread
 import requests
@@ -15,119 +13,81 @@ import google.auth
 
 # ---------- 設定 ----------
 
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets.readonly",
-]
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 
-# チェック対象の日付カラム定義 (0-indexed column, ラベル)
-DATE_COLUMNS = [
-    ("K", "次のタスク期日"),
-    ("M", "締切/公開"),
-    ("Q", "撮影日①"),
-    ("U", "撮影日②"),
-    ("Y", "撮影日③"),
-]
+# Dir名 → Google Chat表示名
+DIR_DISPLAY_NAMES = {
+    "Sho": "池上翔",
+    "翔太": "小峰翔太",
+    "さとしゅん": "佐藤竣",
+}
 
 # 除外ステータス
-SKIP_STATUSES = ["6. 完了", "7. 納品/公開待", "x. なし"]
+SKIP_STATUSES = ["7. 納品/公開待"]
 
-# アラート閾値
-ALERT_THRESHOLDS = [
-    (0, "🚨 本日"),
-    (1, "🔥 明日"),
-    (3, "⚠️ 3日後"),
-]
+# カラムインデックス (0-based)
+COL = {
+    "ID": 0,           # A
+    "CLIENT": 1,       # B
+    "PROJECT": 3,      # D
+    "MEMO": 5,         # F - 次のタスク/メモ
+    "STATUS": 7,       # H
+    "THUMB": 8,        # I - サムネ進捗
+    "NEXT_DATE": 10,   # K - 次の期日
+    "DEADLINE": 12,    # M - 締切/公開
+    "EDIT_START": 13,  # N - 編集着手
+    "DRAFT_PERIOD": 14,# O - 初稿期間(営業日)
+    "HAS_SHOOT": 15,   # P - 撮影有無
+    "SHOOT1": 16,      # Q
+    "SHOOT2": 20,      # U
+    "SHOOT3": 24,      # Y
+    "DIR": 29,         # AD
+}
+
 
 # ---------- ユーティリティ ----------
 
 
-def col_letter_to_index(letter: str) -> int:
-    """列文字(A, B, ..., AA, AB...)を0-indexedの数値に変換"""
-    result = 0
-    for c in letter.upper():
-        result = result * 26 + (ord(c) - ord("A") + 1)
-    return result - 1
-
-
-def parse_date(value: str, today: date) -> date | None:
-    """複数の日付形式をパースする。年省略時は実行年を補完し、過去なら翌年。"""
-    if not value or not value.strip():
-        return None
-
-    value = value.strip().replace("-", "/")
-
-    formats_with_year = ["%Y/%m/%d"]
-    formats_without_year = ["%m/%d"]
-
-    # まず年付きフォーマットを試行
-    for fmt in formats_with_year:
-        try:
-            return datetime.strptime(value, fmt).date()
-        except ValueError:
-            continue
-
-    # 年なしフォーマットを試行
-    for fmt in formats_without_year:
-        try:
-            parsed = datetime.strptime(value, fmt).date()
-            parsed = parsed.replace(year=today.year)
-            if parsed < today:
-                parsed = parsed.replace(year=today.year + 1)
-            return parsed
-        except ValueError:
-            continue
-
-    return None
-
-
-def get_cell(row: list[str], col_index: int) -> str:
-    """行データから安全にセル値を取得"""
+def get_cell(row, col_index):
     if col_index < len(row):
         return row[col_index].strip()
     return ""
 
 
-def find_role_columns(header: list[str]) -> dict[str, int]:
-    """PM・Dir・Editorのヘッダー名を動的に検索して列インデックスを返す"""
-    roles = {}
-    for i, h in enumerate(header):
-        h_lower = h.strip().lower()
-        if "pm" in h_lower:
-            roles["PM"] = i
-        elif "dir" in h_lower:
-            roles["Dir"] = i
-        elif "editor" in h_lower or "編集" in h_lower:
-            roles["Editor"] = i
-    return roles
+def parse_date(value, today):
+    """日付パース。年省略時は実行年を使用（過去日もそのまま）。"""
+    if not value or not value.strip():
+        return None
+    value = value.strip().replace("-", "/")
+    if value in ("なし", "未定", "-"):
+        return None
 
-
-# ---------- アラート判定 ----------
-
-
-def classify_alert(target_date: date, today: date) -> tuple[str, int, str] | None:
-    """
-    日付をアラート分類する。
-    Returns: (カテゴリキー, ソート優先度, 表示テキスト) or None
-    """
-    diff = (target_date - today).days
-
-    if diff < 0:
-        return ("overdue", -1, f"💀 {abs(diff)}日超過")
-    elif diff == 0:
-        return ("today", 0, "🚨 本日期限")
-    elif diff == 1:
-        return ("tomorrow", 1, "🔥 明日期限")
-    elif diff <= 3:
-        return ("in3days", 3, "⚠️ 3日後期限")
-
+    for fmt in ["%Y/%m/%d", "%m/%d"]:
+        try:
+            parsed = datetime.strptime(value, fmt).date()
+            if fmt == "%m/%d":
+                parsed = parsed.replace(year=today.year)
+            return parsed
+        except ValueError:
+            continue
     return None
 
 
-# ---------- メイン処理 ----------
+def add_business_days(start_date, num_days):
+    """営業日を加算（土日除外）"""
+    current = start_date
+    added = 0
+    while added < num_days:
+        current += timedelta(days=1)
+        if current.weekday() < 5:
+            added += 1
+    return current
 
 
-def fetch_sheet_data() -> tuple[list[str], list[list[str]]]:
-    """スプレッドシートからデータを取得"""
+# ---------- データ取得 ----------
+
+
+def fetch_sheet_data():
     spreadsheet_id = os.environ["SPREADSHEET_ID"]
     sheet_name = os.environ["SHEET_NAME"]
 
@@ -140,125 +100,181 @@ def fetch_sheet_data() -> tuple[list[str], list[list[str]]]:
 
     if len(all_values) < 2:
         return [], []
-
-    header = all_values[0]
-    rows = all_values[1:]
-    return header, rows
+    return all_values[0], all_values[1:]
 
 
-def build_alerts(header: list[str], rows: list[list[str]], today: date) -> list[dict]:
-    """全行・全日付カラムをチェックしてアラートリストを生成"""
-    role_cols = find_role_columns(header)
-    alerts = []
+# ---------- 案件分析 ----------
 
-    col_id = col_letter_to_index("A")
-    col_client = col_letter_to_index("B")
-    col_project = col_letter_to_index("D")
-    col_memo = col_letter_to_index("F")
-    col_status = col_letter_to_index("H")
+
+def analyze_project(row, today):
+    """案件を分析してアラートメッセージのリストを返す。
+    Returns: [(emoji, message, sort_priority)]
+      sort_priority: 小さいほど緊急（負=超過, 0=本日, 正=残日数）
+    """
+    messages = []
+
+    project_id = get_cell(row, COL["ID"])
+    if not project_id:
+        return messages
+
+    status = get_cell(row, COL["STATUS"])
+    if any(skip in status for skip in SKIP_STATUSES):
+        return messages
+
+    project = get_cell(row, COL["PROJECT"])
+    has_shoot = get_cell(row, COL["HAS_SHOOT"])
+    thumb_status = get_cell(row, COL["THUMB"])
+
+    # --- 撮影日チェック ---
+    shoot_dates = []
+    for col in [COL["SHOOT1"], COL["SHOOT2"], COL["SHOOT3"]]:
+        d = parse_date(get_cell(row, col), today)
+        if d:
+            shoot_dates.append(d)
+
+    if has_shoot == "あり" and shoot_dates:
+        future_shoots = [d for d in shoot_dates if d >= today]
+        all_shot_done = len(future_shoots) == 0
+
+        # 未来の撮影日アラート
+        for sd in future_shoots:
+            diff = (sd - today).days
+            if diff == 0:
+                messages.append(("🚨", f"「{project}」の撮影は*本日*です", 0))
+            elif diff <= 14:
+                messages.append(("📅", f"「{project}」は撮影日まであと*{diff}日*です", diff))
+
+        # 撮影済み → 素材展開・サムネ発注・文言ぎめが必要
+        if all_shot_done and status in [
+            "0. 未着手/相談中",
+            "1. 企画/撮影準備",
+            "2.5. 0稿編集中",
+        ]:
+            latest_shoot = max(shoot_dates)
+            days_since = (today - latest_shoot).days
+            if days_since <= 14:
+                messages.append((
+                    "🎬",
+                    f"「{project}」は撮影が終わったので、素材の展開と、サムネイルの発注、文言ぎめが必要です",
+                    -1,
+                ))
+
+    # --- 初稿提出期限 ---
+    edit_start = parse_date(get_cell(row, COL["EDIT_START"]), today)
+    draft_period_str = get_cell(row, COL["DRAFT_PERIOD"])
+
+    draft_deadline = None
+    if edit_start and draft_period_str:
+        try:
+            draft_period = int(draft_period_str)
+            draft_deadline = add_business_days(edit_start, draft_period)
+        except ValueError:
+            pass
+
+    if draft_deadline:
+        diff = (draft_deadline - today).days
+        if diff < 0:
+            messages.append(("💀", f"「{project}」は初稿提出期限を*{abs(diff)}日超過*しています", diff))
+        elif diff == 0:
+            messages.append(("🚨", f"「{project}」の初稿提出は*本日*です", 0))
+        elif diff <= 10:
+            messages.append(("📝", f"「{project}」は初稿提出まであと*{diff}日*", diff))
+
+        # サムネイル文言（初稿と同じタイミング、サムネ未完了の場合）
+        thumb_done = thumb_status and ("完了" in thumb_status or "なし" in thumb_status)
+        if not thumb_done:
+            if diff < 0:
+                messages.append(("💀", f"「{project}」サムネイル文言の提出期限を*{abs(diff)}日超過*しています", diff))
+            elif diff == 0:
+                messages.append(("🚨", f"「{project}」サムネイル文言の提出期限は*本日*です", 0))
+            elif diff <= 10:
+                messages.append(("📌", f"「{project}」サムネイル文言の提出期限まであと*{diff}日*です", diff))
+
+    # --- 締切/公開 ---
+    deadline = parse_date(get_cell(row, COL["DEADLINE"]), today)
+    if deadline:
+        diff = (deadline - today).days
+        if diff < 0:
+            messages.append(("💀", f"「{project}」の締切/公開を*{abs(diff)}日超過*しています", diff))
+        elif diff == 0:
+            messages.append(("🚨", f"「{project}」の締切/公開は*本日*です", 0))
+        elif diff <= 14:
+            messages.append(("⏰", f"「{project}」の締切/公開まであと*{diff}日*", diff))
+
+    return messages
+
+
+# ---------- Dir別集計 ----------
+
+
+def build_dir_alerts(rows, today):
+    """Dir別 → クライアント別にアラートを構築"""
+    dir_alerts = {}
 
     for row in rows:
-        row_id = get_cell(row, col_id)
-        if not row_id:
+        dir_name = get_cell(row, COL["DIR"])
+        if not dir_name or dir_name == "未定":
+            continue
+        if dir_name not in DIR_DISPLAY_NAMES:
             continue
 
-        status = get_cell(row, col_status)
-        if any(skip in status for skip in SKIP_STATUSES):
-            continue
+        client = get_cell(row, COL["CLIENT"])
+        messages = analyze_project(row, today)
 
-        client = get_cell(row, col_client)
-        project = get_cell(row, col_project)
-        memo = get_cell(row, col_memo) or "（メモなし）"
+        if messages:
+            if dir_name not in dir_alerts:
+                dir_alerts[dir_name] = {}
+            if client not in dir_alerts[dir_name]:
+                dir_alerts[dir_name][client] = []
+            dir_alerts[dir_name][client].extend(messages)
 
-        # 担当者情報
-        role_parts = []
-        for role_name, col_idx in role_cols.items():
-            person = get_cell(row, col_idx)
-            role_parts.append(f"{role_name}: {person or '—'}")
-        role_text = "｜".join(role_parts) if role_parts else ""
-
-        for col_letter, label in DATE_COLUMNS:
-            col_idx = col_letter_to_index(col_letter)
-            date_str = get_cell(row, col_idx)
-            target_date = parse_date(date_str, today)
-            if target_date is None:
-                continue
-
-            result = classify_alert(target_date, today)
-            if result is None:
-                continue
-
-            category, priority, badge = result
-
-            alerts.append({
-                "category": category,
-                "priority": priority,
-                "badge": badge,
-                "client": client,
-                "project": project,
-                "label": label,
-                "memo": memo,
-                "role_text": role_text,
-                "diff_days": (target_date - today).days,
-            })
-
-    # ソート: 超過(日数大きい順) → 本日 → 明日 → 3日後
-    alerts.sort(key=lambda a: (a["priority"], a["diff_days"]))
-    return alerts
+    return dir_alerts
 
 
-def format_message(alerts: list[dict], today: date) -> str:
-    """アラートリストを通知メッセージに整形"""
+# ---------- メッセージ整形 ----------
+
+
+def format_message(dir_alerts, today):
     date_str = today.strftime("%Y/%m/%d")
 
-    if not alerts:
+    if not dir_alerts:
         return f"📋 サンキャク 本日のタスクアラート（{date_str}）\n\n✅ 本日のアラートはありません"
-
-    # カテゴリ別にグループ化
-    categories = {
-        "overdue": ("💀 期限超過中", []),
-        "today": ("🚨 本日期限", []),
-        "tomorrow": ("🔥 明日期限", []),
-        "in3days": ("⚠️ 3日後期限", []),
-    }
-
-    for alert in alerts:
-        cat = alert["category"]
-        if cat in categories:
-            categories[cat][1].append(alert)
 
     lines = [f"📋 サンキャク 本日のタスクアラート（{date_str}）"]
 
-    for cat_key in ["overdue", "today", "tomorrow", "in3days"]:
-        title, items = categories[cat_key]
-        if not items:
+    for dir_name in ["Sho", "翔太", "さとしゅん"]:
+        if dir_name not in dir_alerts:
             continue
 
+        display = DIR_DISPLAY_NAMES[dir_name]
         lines.append("")
-        lines.append(title)
+        lines.append("━━━━━━━━━━━━━━")
+        lines.append(f"📣 {display}さん")
+        lines.append("━━━━━━━━━━━━━━")
 
-        for a in items:
-            suffix = ""
-            if a["category"] == "overdue":
-                suffix = f" ※{abs(a['diff_days'])}日超過"
-
-            lines.append(
-                f"・{a['client']} / {a['project']}　{a['label']}{suffix}"
-            )
-            lines.append(f"  → {a['memo']}")
-            if a["role_text"]:
-                lines.append(f"     {a['role_text']}")
+        clients = dir_alerts[dir_name]
+        for client, messages in clients.items():
+            messages.sort(key=lambda m: m[2])
+            lines.append("")
+            lines.append(f"▸ {client}")
+            for emoji, msg, _ in messages:
+                lines.append(f"  {emoji} {msg}")
 
     return "\n".join(lines)
 
 
-def send_to_google_chat(message: str):
-    """Google Chat Webhookに送信"""
+# ---------- 送信 ----------
+
+
+def send_to_google_chat(message):
     webhook_url = os.environ["GOOGLE_CHAT_WEBHOOK_URL"]
     payload = {"text": message}
     resp = requests.post(webhook_url, json=payload, timeout=30)
     resp.raise_for_status()
     print(f"Google Chat送信完了 (status: {resp.status_code})")
+
+
+# ---------- メイン ----------
 
 
 def main():
@@ -268,14 +284,13 @@ def main():
     try:
         header, rows = fetch_sheet_data()
         if not header:
-            print("シートにデータがありません")
             send_to_google_chat(
-                f"📋 サンキャク 本日のタスクアラート（{today.strftime('%Y/%m/%d')}）\n\n✅ 本日のアラートはありません"
+                f"📋 サンキャク 本日のタスクアラート（{today.strftime('%Y/%m/%d')}）\n\n✅ データがありません"
             )
             return
 
-        alerts = build_alerts(header, rows, today)
-        message = format_message(alerts, today)
+        dir_alerts = build_dir_alerts(rows, today)
+        message = format_message(dir_alerts, today)
 
         print("--- 通知メッセージ ---")
         print(message)
