@@ -43,7 +43,6 @@ STALE_DAYS = 5
 
 # 空欄チェック対象カラム（他の案件と比べて空欄が目立つ場合に指摘）
 REQUIRED_FIELDS = {
-    "MEMO": (5, "次のタスク/メモ"),
     "DEADLINE": (12, "締切/公開"),
     "EDIT_START": (13, "編集着手"),
     "DRAFT_PERIOD": (14, "初稿期間"),
