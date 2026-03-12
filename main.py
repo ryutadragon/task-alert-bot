@@ -15,11 +15,12 @@ import google.auth
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 
-# Dir名 → Google Chat表示名
-DIR_DISPLAY_NAMES = {
-    "Sho": "池上翔",
-    "翔太": "小峰翔太",
-    "さとしゅん": "佐藤竣",
+# Dir名 → (表示名, Google Chat ユーザーID)
+# ENABLE_MENTIONS=true で本番メンション有効化
+DIR_INFO = {
+    "Sho":       ("池上翔",   ""),  # TODO: Google Chat user ID
+    "翔太":      ("小峰翔太", ""),  # TODO: Google Chat user ID
+    "さとしゅん": ("佐藤竣",  ""),  # TODO: Google Chat user ID
 }
 
 # 除外ステータス
@@ -219,10 +220,11 @@ def build_dir_alerts(rows, today):
         dir_name = get_cell(row, COL["DIR"])
         if not dir_name or dir_name == "未定":
             continue
-        if dir_name not in DIR_DISPLAY_NAMES:
+        if dir_name not in DIR_INFO:
             continue
 
         client = get_cell(row, COL["CLIENT"])
+
         messages = analyze_project(row, today)
 
         if messages:
@@ -240,6 +242,7 @@ def build_dir_alerts(rows, today):
 
 def format_message(dir_alerts, today):
     date_str = today.strftime("%Y/%m/%d")
+    enable_mentions = os.environ.get("ENABLE_MENTIONS", "false").lower() == "true"
 
     if not dir_alerts:
         return f"📋 サンキャク 本日のタスクアラート（{date_str}）\n\n✅ 本日のアラートはありません"
@@ -250,10 +253,14 @@ def format_message(dir_alerts, today):
         if dir_name not in dir_alerts:
             continue
 
-        display = DIR_DISPLAY_NAMES[dir_name]
+        display_name, user_id = DIR_INFO[dir_name]
+        if enable_mentions and user_id:
+            mention = f"<users/{user_id}>"
+        else:
+            mention = f"{display_name}さん"
         lines.append("")
         lines.append("━━━━━━━━━━━━━━")
-        lines.append(f"📣 {display}さん")
+        lines.append(f"📣 {mention}")
         lines.append("━━━━━━━━━━━━━━")
 
         clients = dir_alerts[dir_name]
