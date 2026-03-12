@@ -17,24 +17,39 @@ import google.auth
 
 # ---------- 設定 ----------
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets.readonly",
+    "https://www.googleapis.com/auth/spreadsheets",
+]
 
 # Dir名 → (表示名, Google Chat ユーザーID)
-# ENABLE_MENTIONS=true で本番メンション有効化
 DIR_INFO = {
     "Sho":       ("池上翔",   ""),  # TODO: Google Chat user ID
     "翔太":      ("小峰翔太", ""),  # TODO: Google Chat user ID
     "さとしゅん": ("佐藤竣",  ""),  # TODO: Google Chat user ID
 }
 
-# 管理者（超過フォロー時にメンション）
+# 管理者
 MANAGERS = {
-    "Sho":  ("池上翔",   ""),  # TODO: Google Chat user ID
-    "Ryu":  ("竹内竜太", ""),  # TODO: Google Chat user ID
+    "Sho":  ("池上翔",   ""),
+    "Ryu":  ("竹内竜太", ""),
 }
 
 # 除外ステータス
-SKIP_STATUSES = ["7. 納品/公開待"]
+SKIP_STATUSES = ["7. 納品/公開待", "9. 完了", "x. ペンディング"]
+
+# ステータス停滞とみなす日数
+STALE_DAYS = 5
+
+# 空欄チェック対象カラム（他の案件と比べて空欄が目立つ場合に指摘）
+REQUIRED_FIELDS = {
+    "MEMO": (5, "次のタスク/メモ"),
+    "DEADLINE": (12, "締切/公開"),
+    "EDIT_START": (13, "編集着手"),
+    "DRAFT_PERIOD": (14, "初稿期間"),
+    "DIR": (29, "Dir"),
+    "EDITOR": (30, "Editor"),
+}
 
 # カラムインデックス (0-based)
 COL = {
@@ -43,12 +58,12 @@ COL = {
     "PROJECT": 3,      # D
     "MEMO": 5,         # F
     "STATUS": 7,       # H
-    "THUMB": 8,        # I - サムネ進捗
+    "THUMB": 8,        # I
     "NEXT_DATE": 10,   # K
-    "DEADLINE": 12,    # M - 締切/公開
-    "EDIT_START": 13,  # N - 編集着手
-    "DRAFT_PERIOD": 14,# O - 初稿期間(営業日)
-    "HAS_SHOOT": 15,   # P - 撮影有無
+    "DEADLINE": 12,    # M
+    "EDIT_START": 13,  # N
+    "DRAFT_PERIOD": 14,# O
+    "HAS_SHOOT": 15,   # P
     "SHOOT1": 16,      # Q
     "SHOOT2": 20,      # U
     "SHOOT3": 24,      # Y
@@ -66,13 +81,11 @@ def get_cell(row, col_index):
 
 
 def parse_date(value, today):
-    """日付パース。年省略時は実行年を使用（過去日もそのまま）。"""
     if not value or not value.strip():
         return None
     value = value.strip().replace("-", "/")
     if value in ("なし", "未定", "-"):
         return None
-
     for fmt in ["%Y/%m/%d", "%m/%d"]:
         try:
             parsed = datetime.strptime(value, fmt).date()
@@ -85,7 +98,6 @@ def parse_date(value, today):
 
 
 def add_business_days(start_date, num_days):
-    """営業日を加算（土日除外）"""
     current = start_date
     added = 0
     while added < num_days:
@@ -96,7 +108,6 @@ def add_business_days(start_date, num_days):
 
 
 def mention(name, user_id, enable):
-    """メンション文字列を生成"""
     if enable and user_id:
         return f"<users/{user_id}>"
     return name
@@ -105,29 +116,145 @@ def mention(name, user_id, enable):
 # ---------- データ取得 ----------
 
 
-def fetch_sheet_data():
+def get_gspread_client():
+    creds, _ = google.auth.default(scopes=SCOPES)
+    return gspread.authorize(creds)
+
+
+def fetch_sheet_data(gc):
     spreadsheet_id = os.environ["SPREADSHEET_ID"]
     sheet_name = os.environ["SHEET_NAME"]
-
-    creds, _ = google.auth.default(scopes=SCOPES)
-    gc = gspread.authorize(creds)
-
     sh = gc.open_by_key(spreadsheet_id)
     ws = sh.worksheet(sheet_name)
     all_values = ws.get_all_values()
-
     if len(all_values) < 2:
         return [], []
     return all_values[0], all_values[1:]
+
+
+# ---------- ステータス追跡 ----------
+
+
+def load_tracking(gc):
+    """トラッキングシートから前回のステータスを読み込む"""
+    tracking_id = os.environ.get("TRACKING_SHEET_ID", "")
+    if not tracking_id:
+        return {}
+    try:
+        sh = gc.open_by_key(tracking_id)
+        ws = sh.worksheet("status_log")
+        rows = ws.get_all_values()
+        tracking = {}
+        for r in rows[1:]:
+            if len(r) >= 3 and r[0]:
+                tracking[r[0]] = {"status": r[1], "last_changed": r[2]}
+        return tracking
+    except Exception:
+        return {}
+
+
+def save_tracking(gc, current_statuses, prev_tracking, today):
+    """現在のステータスをトラッキングシートに保存"""
+    tracking_id = os.environ.get("TRACKING_SHEET_ID", "")
+    if not tracking_id:
+        return
+
+    today_str = today.isoformat()
+    rows = [["project_id", "status", "last_changed"]]
+
+    for pid, status in current_statuses.items():
+        prev = prev_tracking.get(pid, {})
+        if prev.get("status") == status:
+            last_changed = prev.get("last_changed", today_str)
+        else:
+            last_changed = today_str
+        rows.append([pid, status, last_changed])
+
+    try:
+        sh = gc.open_by_key(tracking_id)
+        ws = sh.worksheet("status_log")
+        ws.clear()
+        ws.update(range_name="A1", values=rows)
+    except Exception as e:
+        print(f"トラッキング保存エラー: {e}", file=sys.stderr)
+
+
+def detect_stale(rows, prev_tracking, today):
+    """ステータスが STALE_DAYS 以上変わっていない案件を検出"""
+    stale = []
+    for row in rows:
+        pid = get_cell(row, COL["ID"])
+        if not pid:
+            continue
+        status = get_cell(row, COL["STATUS"])
+        if any(skip in status for skip in SKIP_STATUSES):
+            continue
+
+        prev = prev_tracking.get(pid, {})
+        last_changed_str = prev.get("last_changed", "")
+        if not last_changed_str:
+            continue
+
+        try:
+            last_changed = date.fromisoformat(last_changed_str)
+        except ValueError:
+            continue
+
+        days_stale = (today - last_changed).days
+        if days_stale >= STALE_DAYS:
+            client = get_cell(row, COL["CLIENT"])
+            project = get_cell(row, COL["PROJECT"])
+            dir_name = get_cell(row, COL["DIR"])
+            stale.append({
+                "client": client,
+                "project": project,
+                "status": status,
+                "days": days_stale,
+                "dir": dir_name,
+            })
+
+    return stale
+
+
+# ---------- 空欄チェック ----------
+
+
+def detect_blanks(rows):
+    """アクティブ案件で重要フィールドが空欄の案件を検出"""
+    blanks = []
+    for row in rows:
+        pid = get_cell(row, COL["ID"])
+        if not pid:
+            continue
+        status = get_cell(row, COL["STATUS"])
+        if any(skip in status for skip in SKIP_STATUSES):
+            continue
+
+        missing = []
+        for field_key, (col_idx, label) in REQUIRED_FIELDS.items():
+            val = get_cell(row, col_idx)
+            if not val or val in ("未定", "-"):
+                # 撮影なしの案件は編集着手チェックをスキップしない
+                missing.append(label)
+
+        if missing:
+            client = get_cell(row, COL["CLIENT"])
+            project = get_cell(row, COL["PROJECT"])
+            dir_name = get_cell(row, COL["DIR"])
+            blanks.append({
+                "client": client,
+                "project": project,
+                "missing": missing,
+                "dir": dir_name,
+            })
+
+    return blanks
 
 
 # ---------- 案件分析 ----------
 
 
 def analyze_project(row, today):
-    """案件を分析してアラートメッセージのリストを返す。
-    Returns: [(emoji, message, sort_priority, is_overdue_or_today)]
-    """
     messages = []
 
     project_id = get_cell(row, COL["ID"])
@@ -142,7 +269,7 @@ def analyze_project(row, today):
     has_shoot = get_cell(row, COL["HAS_SHOOT"])
     thumb_status = get_cell(row, COL["THUMB"])
 
-    # --- 撮影日チェック ---
+    # --- 撮影日 ---
     shoot_dates = []
     for col in [COL["SHOOT1"], COL["SHOOT2"], COL["SHOOT3"]]:
         d = parse_date(get_cell(row, col), today)
@@ -163,6 +290,7 @@ def analyze_project(row, today):
         if all_shot_done and status in [
             "0. 未着手/相談中",
             "1. 企画/撮影準備",
+            "2. 撮影済/素材待",
             "2.5. 0稿編集中",
         ]:
             latest_shoot = max(shoot_dates)
@@ -225,9 +353,7 @@ def analyze_project(row, today):
 
 
 def build_dir_alerts(rows, today):
-    """Dir別 → クライアント別にアラートを構築"""
     dir_alerts = {}
-
     for row in rows:
         dir_name = get_cell(row, COL["DIR"])
         if not dir_name or dir_name == "未定":
@@ -251,31 +377,26 @@ def build_dir_alerts(rows, today):
 # ---------- メッセージ整形 ----------
 
 
-def format_morning(dir_alerts, today, enable_mentions):
-    """朝の全体通知: @全員 + Dir別全アラート。超過・本日にはDir個人メンション"""
+def format_morning(dir_alerts, stale_items, blank_items, today, enable_mentions):
     date_str = today.strftime("%Y/%m/%d")
 
-    if not dir_alerts:
+    if not dir_alerts and not stale_items and not blank_items:
         return f"📋 サンキャク 本日のタスクアラート（{date_str}）\n\n✅ 本日のアラートはありません"
 
     header = f"📋 サンキャク 本日のタスクアラート（{date_str}）"
     if enable_mentions:
         header += "\n<users/all>"
-
     lines = [header]
 
+    # --- Dir別アラート ---
     for dir_name in ["Sho", "翔太", "さとしゅん"]:
         if dir_name not in dir_alerts:
             continue
 
         display_name, user_id = DIR_INFO[dir_name]
-
-        # このDirに超過・本日アラートがあるか
-        has_urgent = False
-        for msgs in dir_alerts[dir_name].values():
-            if any(m[3] for m in msgs):
-                has_urgent = True
-                break
+        has_urgent = any(
+            m[3] for msgs in dir_alerts[dir_name].values() for m in msgs
+        )
 
         if has_urgent and enable_mentions and user_id:
             name_line = f"📣 <users/{user_id}>"
@@ -294,14 +415,36 @@ def format_morning(dir_alerts, today, enable_mentions):
             for emoji, msg, _, _ in messages:
                 lines.append(f"  {emoji} {msg}")
 
+    # --- ステータス停滞 ---
+    if stale_items:
+        lines.append("")
+        lines.append("━━━━━━━━━━━━━━")
+        lines.append("⏸ ステータス停滞中（5日以上更新なし）")
+        lines.append("━━━━━━━━━━━━━━")
+        for item in stale_items:
+            lines.append(
+                f"  ⚠️ {item['client']} /「{item['project']}」"
+                f"（{item['status']}）*{item['days']}日間*変更なし"
+            )
+
+    # --- 空欄チェック ---
+    if blank_items:
+        lines.append("")
+        lines.append("━━━━━━━━━━━━━━")
+        lines.append("📝 記入漏れ（空欄項目あり）")
+        lines.append("━━━━━━━━━━━━━━")
+        for item in blank_items:
+            missing_str = "、".join(item["missing"])
+            lines.append(
+                f"  ⚠️ {item['client']} /「{item['project']}」→ {missing_str}"
+            )
+
     return "\n".join(lines)
 
 
 def format_followup(dir_alerts, today, enable_mentions):
-    """12時/16時フォロー: 超過案件のみ + 管理者メンション"""
     date_str = today.strftime("%Y/%m/%d")
 
-    # 超過アラートだけ抽出
     overdue_alerts = {}
     for dir_name, clients in dir_alerts.items():
         for client, messages in clients.items():
@@ -312,12 +455,12 @@ def format_followup(dir_alerts, today, enable_mentions):
                 overdue_alerts[dir_name][client] = overdue_msgs
 
     if not overdue_alerts:
-        return None  # 超過なし → 送信しない
+        return None
 
-    # 管理者メンション
-    manager_mentions = []
-    for mgr_name, (display, uid) in MANAGERS.items():
-        manager_mentions.append(mention(display, uid, enable_mentions))
+    manager_mentions = [
+        mention(disp, uid, enable_mentions)
+        for _, (disp, uid) in MANAGERS.items()
+    ]
     manager_line = " ".join(manager_mentions)
 
     lines = [f"🔔 超過案件フォローアップ（{date_str}）"]
@@ -367,7 +510,8 @@ def main():
     print(f"実行日: {today} / モード: {run_mode} / メンション: {enable_mentions}")
 
     try:
-        header, rows = fetch_sheet_data()
+        gc = get_gspread_client()
+        header, rows = fetch_sheet_data(gc)
         if not header:
             if run_mode == "morning":
                 send_to_google_chat(
@@ -377,12 +521,25 @@ def main():
 
         dir_alerts = build_dir_alerts(rows, today)
 
+        # ステータス追跡
+        prev_tracking = load_tracking(gc)
+        current_statuses = {}
+        for row in rows:
+            pid = get_cell(row, COL["ID"])
+            status = get_cell(row, COL["STATUS"])
+            if pid:
+                current_statuses[pid] = status
+
+        stale_items = detect_stale(rows, prev_tracking, today)
+        blank_items = detect_blanks(rows) if run_mode == "morning" else []
+
         if run_mode == "morning":
-            message = format_morning(dir_alerts, today, enable_mentions)
+            message = format_morning(dir_alerts, stale_items, blank_items, today, enable_mentions)
         else:
             message = format_followup(dir_alerts, today, enable_mentions)
             if message is None:
                 print("超過案件なし → フォロー通知スキップ")
+                save_tracking(gc, current_statuses, prev_tracking, today)
                 return
 
         print("--- 通知メッセージ ---")
@@ -390,6 +547,9 @@ def main():
         print("---")
 
         send_to_google_chat(message)
+
+        # トラッキング保存
+        save_tracking(gc, current_statuses, prev_tracking, today)
 
     except Exception as e:
         error_msg = f"⚠️ Bot実行エラー：{e}"

@@ -58,4 +58,5 @@ jobs:
           GOOGLE_CHAT_WEBHOOK_URL: ${{ secrets.GOOGLE_CHAT_WEBHOOK_URL }}
           RUN_MODE: ${{ steps.mode.outputs.mode }}
           ENABLE_MENTIONS: ${{ secrets.ENABLE_MENTIONS }}
+          TRACKING_SHEET_ID: ${{ secrets.TRACKING_SHEET_ID }}
         run: python main.py
