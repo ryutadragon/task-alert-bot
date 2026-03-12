@@ -11,7 +11,7 @@ from datetime import datetime, date
 
 import gspread
 import requests
-from google.oauth2.service_account import Credentials
+import google.auth
 
 # ---------- 設定 ----------
 
@@ -128,12 +128,10 @@ def classify_alert(target_date: date, today: date) -> tuple[str, int, str] | Non
 
 def fetch_sheet_data() -> tuple[list[str], list[list[str]]]:
     """スプレッドシートからデータを取得"""
-    sa_json = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
     spreadsheet_id = os.environ["SPREADSHEET_ID"]
     sheet_name = os.environ["SHEET_NAME"]
 
-    sa_info = json.loads(sa_json)
-    creds = Credentials.from_service_account_info(sa_info, scopes=SCOPES)
+    creds, _ = google.auth.default(scopes=SCOPES)
     gc = gspread.authorize(creds)
 
     sh = gc.open_by_key(spreadsheet_id)

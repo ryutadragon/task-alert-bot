@@ -6,12 +6,22 @@ on:
     - cron: '0 0 * * 1-6'
   workflow_dispatch: # 手動実行用
 
+permissions:
+  id-token: write
+  contents: read
+
 jobs:
   notify:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: 'projects/980331688055/locations/global/workloadIdentityPools/github-pool/providers/github-provider'
+          service_account: 'task-alert-bot@ai-company-489807.iam.gserviceaccount.com'
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -23,7 +33,6 @@ jobs:
 
       - name: Run alert bot
         env:
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           SHEET_NAME: ${{ secrets.SHEET_NAME }}
           GOOGLE_CHAT_WEBHOOK_URL: ${{ secrets.GOOGLE_CHAT_WEBHOOK_URL }}
