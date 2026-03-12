@@ -160,11 +160,15 @@ def analyze_project(row, today):
                 ))
 
     # --- 初稿提出期限 ---
+    # 先方確認以降は初稿済みなのでスキップ
+    draft_done_statuses = ["4. 社内QC", "5. 先方確認", "6. 修正対応中"]
+    draft_already_done = any(s in status for s in draft_done_statuses)
+
     edit_start = parse_date(get_cell(row, COL["EDIT_START"]), today)
     draft_period_str = get_cell(row, COL["DRAFT_PERIOD"])
 
     draft_deadline = None
-    if edit_start and draft_period_str:
+    if edit_start and draft_period_str and not draft_already_done:
         try:
             draft_period = int(draft_period_str)
             draft_deadline = add_business_days(edit_start, draft_period)
