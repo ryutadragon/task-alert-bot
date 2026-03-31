@@ -9,7 +9,7 @@ RUN_MODE:
 
 import os
 import sys
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 
 import gspread
 import requests
@@ -41,32 +41,29 @@ SKIP_STATUSES = ["7. 納品/公開待", "9. 完了", "x. ペンディング"]
 # ステータス停滞とみなす日数
 STALE_DAYS = 5
 
-# 空欄チェック対象カラム（他の案件と比べて空欄が目立つ場合に指摘）
+# 空欄チェック対象カラム（アクティブ案件で空欄だと指摘）
 REQUIRED_FIELDS = {
-    "DEADLINE": (12, "締切/公開"),
-    "EDIT_START": (13, "編集着手"),
-    "DRAFT_PERIOD": (14, "初稿期間"),
-    "DIR": (29, "Dir"),
-    "EDITOR": (30, "Editor"),
+    "DEADLINE": (7, "公開日"),
+    "DIR": (13, "Dir"),
+    "EDITOR": (14, "Editor"),
 }
 
-# カラムインデックス (0-based)
+# カラムインデックス (0-based) — 案件管理シートの実際の列順に対応
 COL = {
-    "ID": 0,           # A
-    "CLIENT": 1,       # B
-    "PROJECT": 3,      # D
-    "MEMO": 5,         # F
-    "STATUS": 7,       # H
-    "THUMB": 8,        # I
-    "NEXT_DATE": 10,   # K
-    "DEADLINE": 12,    # M
-    "EDIT_START": 13,  # N
-    "DRAFT_PERIOD": 14,# O
-    "HAS_SHOOT": 15,   # P
-    "SHOOT1": 16,      # Q
-    "SHOOT2": 20,      # U
-    "SHOOT3": 24,      # Y
-    "DIR": 29,         # AD
+    "ID": 0,           # A: ID
+    "CLIENT": 1,       # B: クライアント
+    "PROJECT": 5,      # F: 案件名
+    "DEADLINE": 7,     # H: 公開
+    "MEMO": 8,         # I: 次のタスク/メモ
+    "STATUS": 9,       # J: ステータス
+    "THUMB": 10,       # K: サムネ進捗
+    "PM": 12,          # M: PM
+    "DIR": 13,         # N: Dir
+    "EDITOR": 14,      # O: Editor
+    "HAS_SHOOT": 19,   # T: 撮影有無
+    "SHOOT1": 20,      # U: 撮影日1
+    "SHOOT2": 24,      # Y: 撮影日2
+    "SHOOT3": 28,      # AC: 撮影日3
 }
 
 
@@ -94,16 +91,6 @@ def parse_date(value, today):
         except ValueError:
             continue
     return None
-
-
-def add_business_days(start_date, num_days):
-    current = start_date
-    added = 0
-    while added < num_days:
-        current += timedelta(days=1)
-        if current.weekday() < 5:
-            added += 1
-    return current
 
 
 def mention(name, user_id, enable):
@@ -300,39 +287,6 @@ def analyze_project(row, today):
                     f"「{project}」は撮影が終わったので、素材の展開と、サムネイルの発注、文言ぎめが必要です",
                     -1, True,
                 ))
-
-    # --- 初稿提出期限 ---
-    draft_done_statuses = ["4. 社内QC", "5. 先方確認", "6. 修正対応中"]
-    draft_already_done = any(s in status for s in draft_done_statuses)
-
-    edit_start = parse_date(get_cell(row, COL["EDIT_START"]), today)
-    draft_period_str = get_cell(row, COL["DRAFT_PERIOD"])
-
-    draft_deadline = None
-    if edit_start and draft_period_str and not draft_already_done:
-        try:
-            draft_period = int(draft_period_str)
-            draft_deadline = add_business_days(edit_start, draft_period)
-        except ValueError:
-            pass
-
-    if draft_deadline:
-        diff = (draft_deadline - today).days
-        if diff < 0:
-            messages.append(("💀", f"「{project}」は初稿提出期限を*{abs(diff)}日超過*しています", diff, True))
-        elif diff == 0:
-            messages.append(("🚨", f"「{project}」の初稿提出は*本日*です", 0, True))
-        elif diff <= 10:
-            messages.append(("📝", f"「{project}」は初稿提出まであと*{diff}日*", diff, False))
-
-        thumb_done = thumb_status and ("完了" in thumb_status or "なし" in thumb_status)
-        if not thumb_done:
-            if diff < 0:
-                messages.append(("💀", f"「{project}」サムネイル文言の提出期限を*{abs(diff)}日超過*しています", diff, True))
-            elif diff == 0:
-                messages.append(("🚨", f"「{project}」サムネイル文言の提出期限は*本日*です", 0, True))
-            elif diff <= 10:
-                messages.append(("📌", f"「{project}」サムネイル文言の提出期限まであと*{diff}日*です", diff, False))
 
     # --- 締切/公開 ---
     deadline = parse_date(get_cell(row, COL["DEADLINE"]), today)
