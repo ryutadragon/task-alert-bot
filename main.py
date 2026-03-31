@@ -41,13 +41,6 @@ SKIP_STATUSES = ["7. 納品/公開待", "9. 完了", "x. ペンディング"]
 # ステータス停滞とみなす日数
 STALE_DAYS = 5
 
-# 空欄チェック対象カラム（アクティブ案件で空欄だと指摘）
-REQUIRED_FIELDS = {
-    "DEADLINE": (7, "公開日"),
-    "DIR": (13, "Dir"),
-    "EDITOR": (14, "Editor"),
-}
-
 # カラムインデックス (0-based) — 案件管理シートの実際の列順に対応
 COL = {
     "ID": 0,           # A: ID
@@ -202,41 +195,6 @@ def detect_stale(rows, prev_tracking, today):
     return stale
 
 
-# ---------- 空欄チェック ----------
-
-
-def detect_blanks(rows):
-    """アクティブ案件で重要フィールドが空欄の案件を検出"""
-    blanks = []
-    for row in rows:
-        pid = get_cell(row, COL["ID"])
-        if not pid:
-            continue
-        status = get_cell(row, COL["STATUS"])
-        if any(skip in status for skip in SKIP_STATUSES):
-            continue
-
-        missing = []
-        for field_key, (col_idx, label) in REQUIRED_FIELDS.items():
-            val = get_cell(row, col_idx)
-            if not val or val in ("未定", "-"):
-                # 撮影なしの案件は編集着手チェックをスキップしない
-                missing.append(label)
-
-        if missing:
-            client = get_cell(row, COL["CLIENT"])
-            project = get_cell(row, COL["PROJECT"])
-            dir_name = get_cell(row, COL["DIR"])
-            blanks.append({
-                "client": client,
-                "project": project,
-                "missing": missing,
-                "dir": dir_name,
-            })
-
-    return blanks
-
-
 # ---------- 案件分析 ----------
 
 
@@ -330,10 +288,10 @@ def build_dir_alerts(rows, today):
 # ---------- メッセージ整形 ----------
 
 
-def format_morning(dir_alerts, stale_items, blank_items, today, enable_mentions):
+def format_morning(dir_alerts, stale_items, today, enable_mentions):
     date_str = today.strftime("%Y/%m/%d")
 
-    if not dir_alerts and not stale_items and not blank_items:
+    if not dir_alerts and not stale_items:
         return f"📋 サンキャク 本日のタスクアラート（{date_str}）\n\n✅ 本日のアラートはありません"
 
     header = f"📋 サンキャク 本日のタスクアラート（{date_str}）"
@@ -390,18 +348,6 @@ def format_morning(dir_alerts, stale_items, blank_items, today, enable_mentions)
             lines.append(
                 f"  ⚠️ {item['client']} /「{item['project']}」"
                 f"（{item['status']}）*{item['days']}日間*変更なし"
-            )
-
-    # --- 空欄チェック ---
-    if blank_items:
-        lines.append("")
-        lines.append("━━━━━━━━━━━━━━")
-        lines.append("📝 記入漏れ（空欄項目あり）")
-        lines.append("━━━━━━━━━━━━━━")
-        for item in blank_items:
-            missing_str = "、".join(item["missing"])
-            lines.append(
-                f"  ⚠️ {item['client']} /「{item['project']}」→ {missing_str}"
             )
 
     return "\n".join(lines)
@@ -496,10 +442,9 @@ def main():
                 current_statuses[pid] = status
 
         stale_items = detect_stale(rows, prev_tracking, today)
-        blank_items = detect_blanks(rows) if run_mode == "morning" else []
 
         if run_mode == "morning":
-            message = format_morning(dir_alerts, stale_items, blank_items, today, enable_mentions)
+            message = format_morning(dir_alerts, stale_items, today, enable_mentions)
         else:
             message = format_followup(dir_alerts, today, enable_mentions)
             if message is None:
