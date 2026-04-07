@@ -56,6 +56,7 @@ jobs:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           SHEET_NAME: ${{ secrets.SHEET_NAME }}
           GOOGLE_CHAT_WEBHOOK_URL: ${{ secrets.GOOGLE_CHAT_WEBHOOK_URL }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           RUN_MODE: ${{ steps.mode.outputs.mode }}
           ENABLE_MENTIONS: ${{ secrets.ENABLE_MENTIONS }}
           TRACKING_SHEET_ID: ${{ secrets.TRACKING_SHEET_ID }}

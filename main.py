@@ -1,6 +1,6 @@
 """
 サンキャク 案件管理タスクアラートBot
-Master_DBシートを読み取り、Dir別にタスク状況をGoogle Chatに通知する。
+Master_DBシートを読み取り、Dir別にタスク状況をGoogle Chat + Slackに通知する。
 
 RUN_MODE:
   morning  - 朝の全体通知（@全員 + Dir別全アラート）
@@ -14,6 +14,8 @@ from datetime import datetime, date
 import gspread
 import requests
 import google.auth
+from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
 
 # ---------- 設定 ----------
 
@@ -22,17 +24,17 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
 ]
 
-# Dir名 → (表示名, Google Chat ユーザーID)
+# Dir名 → (表示名, Google Chat ユーザーID, Slack ユーザーID)
 DIR_INFO = {
-    "Sho":       ("池上翔",   "103766992526420785455"),
-    "翔太":      ("小峰翔太", "112110647990602264741"),
-    "さとしゅん": ("佐藤竣",  "105169517756611623614"),
+    "Sho":       ("池上翔",   "103766992526420785455", "U01TT135Y4A"),
+    "翔太":      ("小峰翔太", "112110647990602264741", "U01TPV9MCVC"),
+    "さとしゅん": ("佐藤竣",  "105169517756611623614", "U06S2LPTCQH"),
 }
 
 # 管理者
 MANAGERS = {
-    "Sho":  ("池上翔",   "103766992526420785455"),
-    "Ryu":  ("竹内竜太", "103825177855643919422"),
+    "Sho":  ("池上翔",   "103766992526420785455", "U01TT135Y4A"),
+    "Ryu":  ("竹内竜太", "103825177855643919422", "U016ZDVNGJ0"),
 }
 
 # 除外ステータス
@@ -86,9 +88,15 @@ def parse_date(value, today):
     return None
 
 
-def mention(name, user_id, enable):
+def mention_gchat(name, user_id, enable):
     if enable and user_id:
         return f"<users/{user_id}>"
+    return name
+
+
+def mention_slack(name, slack_id, enable):
+    if enable and slack_id:
+        return f"<@{slack_id}>"
     return name
 
 
@@ -288,41 +296,43 @@ def build_dir_alerts(rows, today):
 # ---------- メッセージ整形 ----------
 
 
-def format_morning(dir_alerts, stale_items, today, enable_mentions):
+def _format_morning_core(dir_alerts, stale_items, today, enable_mentions, platform):
+    """morning メッセージ生成。platform: 'gchat' or 'slack'"""
     date_str = today.strftime("%Y/%m/%d")
+    m = mention_gchat if platform == "gchat" else mention_slack
+    id_idx = 1 if platform == "gchat" else 2
 
     if not dir_alerts and not stale_items:
         return f"📋 サンキャク 本日のタスクアラート（{date_str}）\n\n✅ 本日のアラートはありません"
 
     header = f"📋 サンキャク 本日のタスクアラート（{date_str}）"
     if enable_mentions:
-        header += "\n<users/all>"
+        header += "\n<users/all>" if platform == "gchat" else "\n<!channel>"
 
-    # 全体で超過・期限迫りがあるか判定
     any_urgent = any(
-        m[3]
+        msg[3]
         for clients in dir_alerts.values()
         for msgs in clients.values()
-        for m in msgs
+        for msg in msgs
     )
-    ryu_display, ryu_id = MANAGERS["Ryu"]
-    if any_urgent and enable_mentions and ryu_id:
-        header += f"\ncc: <users/{ryu_id}>"
+    ryu_info = MANAGERS["Ryu"]
+    if any_urgent and enable_mentions:
+        header += f"\ncc: {m(ryu_info[0], ryu_info[id_idx], True)}"
 
     lines = [header]
 
-    # --- Dir別アラート ---
     for dir_name in ["Sho", "翔太", "さとしゅん"]:
         if dir_name not in dir_alerts:
             continue
 
-        display_name, user_id = DIR_INFO[dir_name]
+        info = DIR_INFO[dir_name]
+        display_name, uid = info[0], info[id_idx]
         has_urgent = any(
-            m[3] for msgs in dir_alerts[dir_name].values() for m in msgs
+            msg[3] for msgs in dir_alerts[dir_name].values() for msg in msgs
         )
 
-        if has_urgent and enable_mentions and user_id:
-            name_line = f"📣 <users/{user_id}>"
+        if has_urgent and enable_mentions and uid:
+            name_line = f"📣 {m(display_name, uid, True)}"
         else:
             name_line = f"📣 {display_name}さん"
 
@@ -332,13 +342,12 @@ def format_morning(dir_alerts, stale_items, today, enable_mentions):
         lines.append("━━━━━━━━━━━━━━")
 
         for client, messages in dir_alerts[dir_name].items():
-            messages.sort(key=lambda m: m[2])
+            messages.sort(key=lambda x: x[2])
             lines.append("")
             lines.append(f"▸ {client}")
             for emoji, msg, _, _ in messages:
                 lines.append(f"  {emoji} {msg}")
 
-    # --- ステータス停滞 ---
     if stale_items:
         lines.append("")
         lines.append("━━━━━━━━━━━━━━")
@@ -353,13 +362,16 @@ def format_morning(dir_alerts, stale_items, today, enable_mentions):
     return "\n".join(lines)
 
 
-def format_followup(dir_alerts, today, enable_mentions):
+def _format_followup_core(dir_alerts, today, enable_mentions, platform):
+    """followup メッセージ生成。platform: 'gchat' or 'slack'"""
     date_str = today.strftime("%Y/%m/%d")
+    m = mention_gchat if platform == "gchat" else mention_slack
+    id_idx = 1 if platform == "gchat" else 2
 
     overdue_alerts = {}
     for dir_name, clients in dir_alerts.items():
         for client, messages in clients.items():
-            overdue_msgs = [m for m in messages if m[2] < 0]
+            overdue_msgs = [msg for msg in messages if msg[2] < 0]
             if overdue_msgs:
                 if dir_name not in overdue_alerts:
                     overdue_alerts[dir_name] = {}
@@ -369,8 +381,8 @@ def format_followup(dir_alerts, today, enable_mentions):
         return None
 
     manager_mentions = [
-        mention(disp, uid, enable_mentions)
-        for _, (disp, uid) in MANAGERS.items()
+        m(info[0], info[id_idx], enable_mentions)
+        for _, info in MANAGERS.items()
     ]
     manager_line = " ".join(manager_mentions)
 
@@ -381,8 +393,9 @@ def format_followup(dir_alerts, today, enable_mentions):
         if dir_name not in overdue_alerts:
             continue
 
-        display_name, user_id = DIR_INFO[dir_name]
-        name_str = mention(display_name, user_id, enable_mentions)
+        info = DIR_INFO[dir_name]
+        display_name, uid = info[0], info[id_idx]
+        name_str = m(display_name, uid, enable_mentions)
 
         lines.append("")
         lines.append("━━━━━━━━━━━━━━")
@@ -390,7 +403,7 @@ def format_followup(dir_alerts, today, enable_mentions):
         lines.append("━━━━━━━━━━━━━━")
 
         for client, messages in overdue_alerts[dir_name].items():
-            messages.sort(key=lambda m: m[2])
+            messages.sort(key=lambda x: x[2])
             lines.append("")
             lines.append(f"▸ {client}")
             for emoji, msg, _, _ in messages:
@@ -399,15 +412,47 @@ def format_followup(dir_alerts, today, enable_mentions):
     return "\n".join(lines)
 
 
+def format_morning(dir_alerts, stale_items, today, enable_mentions):
+    return _format_morning_core(dir_alerts, stale_items, today, enable_mentions, "gchat")
+
+
+def format_followup(dir_alerts, today, enable_mentions):
+    return _format_followup_core(dir_alerts, today, enable_mentions, "gchat")
+
+
+def format_morning_slack(dir_alerts, stale_items, today, enable_mentions):
+    return _format_morning_core(dir_alerts, stale_items, today, enable_mentions, "slack")
+
+
+def format_followup_slack(dir_alerts, today, enable_mentions):
+    return _format_followup_core(dir_alerts, today, enable_mentions, "slack")
+
+
 # ---------- 送信 ----------
 
 
 def send_to_google_chat(message):
-    webhook_url = os.environ["GOOGLE_CHAT_WEBHOOK_URL"]
+    webhook_url = os.environ.get("GOOGLE_CHAT_WEBHOOK_URL")
+    if not webhook_url:
+        print("GOOGLE_CHAT_WEBHOOK_URL 未設定 → Google Chat送信スキップ")
+        return
     payload = {"text": message}
     resp = requests.post(webhook_url, json=payload, timeout=30)
     resp.raise_for_status()
     print(f"Google Chat送信完了 (status: {resp.status_code})")
+
+
+SLACK_CHANNEL_ID = "C0AR6CE7213"  # #制作進捗管理
+
+
+def send_to_slack(message):
+    token = os.environ.get("SLACK_BOT_TOKEN")
+    if not token:
+        print("SLACK_BOT_TOKEN 未設定 → Slack送信スキップ")
+        return
+    client = WebClient(token=token)
+    resp = client.chat_postMessage(channel=SLACK_CHANNEL_ID, text=message)
+    print(f"Slack送信完了 (channel: {SLACK_CHANNEL_ID}, ts: {resp['ts']})")
 
 
 # ---------- メイン ----------
@@ -444,19 +489,26 @@ def main():
         stale_items = detect_stale(rows, prev_tracking, today)
 
         if run_mode == "morning":
-            message = format_morning(dir_alerts, stale_items, today, enable_mentions)
+            gchat_msg = format_morning(dir_alerts, stale_items, today, enable_mentions)
+            slack_msg = format_morning_slack(dir_alerts, stale_items, today, enable_mentions)
         else:
-            message = format_followup(dir_alerts, today, enable_mentions)
-            if message is None:
+            gchat_msg = format_followup(dir_alerts, today, enable_mentions)
+            slack_msg = format_followup_slack(dir_alerts, today, enable_mentions)
+            if gchat_msg is None and slack_msg is None:
                 print("超過案件なし → フォロー通知スキップ")
                 save_tracking(gc, current_statuses, prev_tracking, today)
                 return
 
-        print("--- 通知メッセージ ---")
-        print(message)
+        print("--- Google Chat ---")
+        print(gchat_msg)
+        print("--- Slack ---")
+        print(slack_msg)
         print("---")
 
-        send_to_google_chat(message)
+        if gchat_msg:
+            send_to_google_chat(gchat_msg)
+        if slack_msg:
+            send_to_slack(slack_msg)
 
         # トラッキング保存
         save_tracking(gc, current_statuses, prev_tracking, today)
@@ -466,6 +518,7 @@ def main():
         print(error_msg, file=sys.stderr)
         try:
             send_to_google_chat(error_msg)
+            send_to_slack(error_msg)
         except Exception as send_err:
             print(f"エラー通知の送信にも失敗: {send_err}", file=sys.stderr)
         sys.exit(1)
