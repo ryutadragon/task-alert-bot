@@ -12,6 +12,7 @@ import sys
 from datetime import datetime, date
 
 import gspread
+import jpholiday
 import requests
 import google.auth
 from slack_sdk import WebClient
@@ -445,10 +446,22 @@ def send_to_google_chat(message):
 SLACK_CHANNEL_ID = "C0AR6CE7213"  # #制作進捗管理
 
 
+def is_slack_silent_day(today):
+    if today.weekday() >= 5:
+        return True, "土日"
+    if jpholiday.is_holiday(today):
+        return True, f"祝日（{jpholiday.is_holiday_name(today)}）"
+    return False, ""
+
+
 def send_to_slack(message):
     token = os.environ.get("SLACK_BOT_TOKEN")
     if not token:
         print("SLACK_BOT_TOKEN 未設定 → Slack送信スキップ")
+        return
+    silent, reason = is_slack_silent_day(date.today())
+    if silent:
+        print(f"Slack送信スキップ（{reason}）")
         return
     client = WebClient(token=token)
     resp = client.chat_postMessage(channel=SLACK_CHANNEL_ID, text=message)
