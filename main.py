@@ -433,14 +433,8 @@ def format_followup_slack(dir_alerts, today, enable_mentions):
 
 
 def send_to_google_chat(message):
-    webhook_url = os.environ.get("GOOGLE_CHAT_WEBHOOK_URL")
-    if not webhook_url:
-        print("GOOGLE_CHAT_WEBHOOK_URL 未設定 → Google Chat送信スキップ")
-        return
-    payload = {"text": message}
-    resp = requests.post(webhook_url, json=payload, timeout=30)
-    resp.raise_for_status()
-    print(f"Google Chat送信完了 (status: {resp.status_code})")
+    print("Google Chat送信は無効化されています")
+    return
 
 
 SLACK_CHANNEL_ID = "C0AR6CE7213"  # #制作進捗管理
@@ -482,10 +476,6 @@ def main():
         gc = get_gspread_client()
         header, rows = fetch_sheet_data(gc)
         if not header:
-            if run_mode == "morning":
-                send_to_google_chat(
-                    f"📋 サンキャク 本日のタスクアラート（{today.strftime('%Y/%m/%d')}）\n\n✅ データがありません"
-                )
             return
 
         dir_alerts = build_dir_alerts(rows, today)
