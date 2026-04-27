@@ -349,17 +349,6 @@ def _format_morning_core(dir_alerts, stale_items, today, enable_mentions, platfo
             for emoji, msg, _, _ in messages:
                 lines.append(f"  {emoji} {msg}")
 
-    if stale_items:
-        lines.append("")
-        lines.append("━━━━━━━━━━━━━━")
-        lines.append("⏸ ステータス停滞中（5日以上更新なし）")
-        lines.append("━━━━━━━━━━━━━━")
-        for item in stale_items:
-            lines.append(
-                f"  ⚠️ {item['client']} /「{item['project']}」"
-                f"（{item['status']}）*{item['days']}日間*変更なし"
-            )
-
     return "\n".join(lines)
 
 
